@@ -100,5 +100,226 @@ auto lookup_cache_or_build_graph_fwd(int B, int H, int T, int HS, int is_inferen
                             .set_is_pass_by_value(true)
                             .set_data_type(fe::DataType_t::FLOAT));
 
-                            
+    auto sdpa_options = fe::graph::SDPA_attributes().set_name("flash_attention");
+    sdpa_options.set_is_inference(is_inference_only);
+    sdpa_options.set_attn_scale(attn_scale);
+    sdpa_options.set_causal_mask(true);
+
+    // create the graph operation and the output tensors back
+    auto[O, stats] = graph->sdpa(Q, K, V, sdpa_options);
+
+    // output is (B, T, NH, HS) BF16/FP16 and stats for backward pass is (B, NH, T) FP32
+    O->ser_output(true). set_dim({B, H, T, HS}).set_stride({H * HS * T, HS, H * HS, 1}).set_uid(O_UID);
+
+    assert(stats == nullptr || is_inference_only == false);
+    if (is_inference_only == false) {
+        stats->set_output(true).set_data_type(fe::DataType_t::FLOAT)
+            .set_dim({B, H, T, 1})
+            .set_stride({H * T, T, 1, 1})
+            .set_uid(Stats_UID);
+    }
+
+    checkCudnnFE(graph->validaate());
+
+    // build the operation graph and execution part (this is the very slow part)
+    checkCudnnFE(graph->build_operation_graph(cudnn_handle));
+    auto plans = graph->create_execution_plans({fe::HeurMode_t::A});
+    checkCudnnFE(graph->check_support(cudnn_handle));
+    checkCudnnFE(graph->build_plans(cudnn_handle));
+
+    // reallocate the workspace if the required size id greater thatnt eh current workspace
+    // in H100 this may be around 16B
+    if (graph->get_workspace_size() > cudnn_workspace_size) {
+        if (cudnn_workspace_size > 0) {
+            cudaCheck(cudaFree(cudnn_workspace));
+        }
+
+        cudnn_workspace_size = graph->get_workspace_size();
+        cudaCheck(cudaMalloc(&cudnn_workspace, cudnn_workspace_size));
+    }
+
+    user_maintained_cache_fwd.insert({key, graph});
+    return graph;
+
+}
+
+
+auto lookup_cache_or_build_graph_bwd(int B, int NH, int T, int HS) {
+    static cache_type_bwd user_maintained_cache_bwd;
+
+    auto key = std::make_tuple(B, NH, T, HS);
+
+    auto it = user_maintained_cache_bwd.find(key);
+    if (it != user_maintained_cache_bwd.end()) {
+        return it->second;
+    }
+
+    auto graph = std::make_shared<fe::graph::Graph>();
+    graph->set_to_data_type(CUDNN_16BIT)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+
+
+    // (B, N, 3, NH, HS)
+    // must come from inp (which means we also need to convert that to FP16)
+    auto Q = graph->tensor(fe::graph::Tensor_attributes().set_name("Q")
+                .set_dim({B, NH, T, HS})
+                .set_uid(Q_UID)
+                .set_stride({3*NH*HS*T, HS, 3*NH*HS, 1}));
+
+    auto K = graph->tensor(fe::graph::Tensor_attributes().set_name("K")
+                .set_dim({B, NH, T, HS})
+                .set_uid(K_UID)
+                .set_stride({3*NH*HS*T, HS, 3*NH*HS, 1}));
+
+    auto V = graph->tensor(fe::graph::Tensor_attributes().set_name("V")
+                .set_dim({B, NH, T, HS})
+                .set_uid(V_UID)
+                .set_stride({3*NH*HS*T, HS, 3*NH*HS, 1}));
+
+    auto dO = graph->tensor(fe::graph::Tensor_attributes().set_name("stats")
+                .set_dim({B, NH, T, 1})
+                .set_uid(Stats_UID)
+                .set_stride({NH*T, T, 1, 1})
+                .set_data_type(fe::FataType_t::FLOAT);
+
+    auto attn_scale = graph->tensor(fe::graph::Tensor_attributes().set_name("attn_scale")
+                .set_dim({1, 1, 1 , 1})
+                .set_stride({1, 1, 1, 1})
+                .set_is_pass_by_value(true)
+                .set_uid(Attn_scale_UID)
+                .set_data_type(fe::DataType_t::FLOAT));
+
+    auto sdpa_backward_options = fe::graph::SDPA_backward_attributes()
+                .set_name("flash_attention_backward")
+#if CUDNN_FRONTEND_MAJOR_VERSION > 1 && CUDNN_FRONTEND_MINOR_VERSION >=5  // i think this should be AND
+                .set_deterministic_algorithm(true)      // 1.5+ needs this for determinism
+#endif  
+                .set_causal_mask(true)
+                .set_attn_scale(attn_scale);
+
+
+    // create the graph operation and get the output tensors back
+    auto [dQ, dK, dV] = graph->sdpa_backward(Q, K, V, O, dO, stats, sdpa_backward_options);
+
+    dQ->set_output(true).set_dim({B, NH, T, HS}).set_stride({3*NH*HS*T, HS, 3*NH*HS, 1}).set_uid(dQ_UID);
+    dK->set_output(true).set_dim({B, NH, T, HS}).set_stride({3*NH*HS*T, HS, 3*NH*HS, 1}).set_uid(dK_UID);
+    dV->set_output(true).set_dim({B, NH, T, HS}).set_stride({3*NH*HS*T, HS, 3*NH*HS, 1}).set_uid(dV_UID);
+
+    checkCudnnFE(graph->validate());
+
+    // build the operation graph and execution part (this is the very slow part)
+    checkCudnnFE(graph->build_operation_graph(cudnn_handle));
+    auto plans = graph->create_execution_plans({fe::HeurMode_t::A});
+    checkCdnnFE(graph->build_plans(cudnn_handle));
+
+
+    // reallocate the workspace if the required size id greater than the current workspace
+    // by default, cuDNN uses up to 256 MiB of workspace so we don't want to just allocate the maximum
+    if (graph_get_workspace_size() > cudnn_workspace_size) {
+        if (cudnn_workspace_size > 0) {
+            cudaCheck(cudaFree(cudnn_workspace));
+        }
+
+        cudnn_workspace_size = graph->get_workspace_size();
+        cudaCheck(cudaMalloc(&cudnn_workspace, cudnn_workspace_size));
+    }
+
+    user_maintained_cache_bwd.insert({key, graph});
+    return graph;
+}
+
+
+void attention_forward_cudnn(   floatX* out, // output: (B, T, NH, HS) 
+                                float* stats, // output for backward pass: (B, NH, T)
+                                floatX* inp, // input: (B, T, 3, NH, HS), QKV
+                                int B, int T, int NH, int C, cudaStream stream) {
+
+    NVTX_RANGE_FB();
+    int HS = C/NH;  // number of features per head
+    bool is_inference_only = (stats == nullptr);
+
+
+    cuDNNCheck(cudnnSetStream(cudnn_handle, stream));
+
+    // get graph and tensors from cashe (or generate it on first use)
+    auto graph = lookup_cache_or_build_graph_fwd(B, NH, T, HS, is_inference_only);
+
+    // prepare all the tensor pointers for executing the graph
+    void* devPtrQ = inp;
+    void* devPtrK = inp + C;
+    void* devPtrV = inp + 2 * C;
+    float attn_scale_cpu = 1.0/sqrt(HS);
+    void* devPtrO = out;
+
+    // build variant pack
+    std::unordered_map<int64_t, void*> variant_pack = {
+        {Q_UID, devPtrQ},
+        {K_UID, devPtrK},
+        {V_UID, devPtrV},
+        {Attn_scale_UID, &attn_scale_cpu},
+        {O_UID, devPtrO}
+    };
+
+    // add the stats tensor unless we are only doing inference (only needed for backward pass)
+    if (is_inference_only == false) {
+        variant_pack[Stats_UID] = stats;
+    }
+
+    // execute graph
+    checkCudnnFE(graph->execute(cudnn_handle, variant_pack, cudnn_workspace));
+    cudaCheck(cudaGetLasrtError());
+}
+
+
+void attnetion_backward_cudnn(  floatX* dqkvr,            // output
+                                floatX* dout, floatX* qkvr, floatX* o, float* stats,  // inputs
+                                int B, int T, int NH, int C, cudaStream_t stream) {
+
+    NVTX_RANGE_FN();
+    int HS = C / NH; // number of features per head
+
+    // get graph and tensors from cache (or generate it on first use)
+    auto graph = lookup_cache_or_build_graph_bwd(B, NH, T, HS);
+
+    // prepare all the tensor pointers for executing the graph
+    void* devPtrQ = qkvr;
+    void* devPtrK = qkvr + NH * HS;
+    void* devPtrV = qkvr + 2 * NH * HS;
+    void* devPtrO = o;
+    void* devPtrdO = dout;
+    void* devPtrStats = stats;
+    float attn_scale_cpu = 1.0/sqrt(HS);
+
+    void* devPtrdQ = dqkvr;
+    void* devPtrdK = dqkvr + NH * HS;
+    void* devPtrdV = dqkvr + 2 * NH * HS;
+
+    // build variant pack that links each tensor to its data pointer
+    std::unordered_map<int64_t, void*> variant_pack = {
+        {Q_UID, devPtrQ},
+        {K_UID, devPtrK},
+        {V_UID, devPtrV},
+        {O_UID, devPtrO},   
+        {dO_UID, devPtrdO},   
+        {Stats_UID, devPtrStats},   
+        {dQ_UID, devPtrdQ},
+        {dK_UID, devPtrdK},
+        {dV_UID, devPtrdV},      
+        {Attn_scale_UID, &attn_scale_cpu}          
+    };
+
+    // execute graph
+    cuDNNCheck(cudnnSetStream(cudnn_handle, stream));
+    checkCudnnFE(graph->execute(cudnn_handle, variant_pack, cudnn_workspace));
+    cudaCheck(cudaGetLastError());
+}
+
+void create_cudnn() {
+    cuDNNCheck(cudnnCreate(&cudnn_handle));
+}
+
+void destroy_cudnn() {
+    if (cudnn_workspace != NULL) { cudaCheck(cudaFree(cudnn_workspace)); }
+    cuDNNCheck(cudnnDestroy(cudnn_handle));
 }
